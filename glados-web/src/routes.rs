@@ -56,209 +56,6 @@ pub async fn handle_error(_err: io::Error) -> impl IntoResponse {
     (StatusCode::INTERNAL_SERVER_ERROR, "Something went wrong...")
 }
 
-#[derive(FromQueryResult, Debug, Clone, Copy)]
-pub struct MaxCensusId {
-    pub id: i32,
-}
-
-#[derive(FromQueryResult, Serialize, Debug, Clone)]
-pub struct PaginatedCensusListResult {
-    pub census_id: i32,
-    pub node_count: i64,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(FromQueryResult, Debug, Clone)]
-pub struct CensusCreatedAt {
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(FromQueryResult, Debug)]
-pub struct RadiusChartData {
-    pub data_radius: Vec<u8>,
-    pub node_id: Vec<u8>,
-    pub raw: String,
-}
-
-#[derive(Serialize, Debug)]
-pub struct CalculatedRadiusChartData {
-    pub data_radius: f64,
-    /// Top byte of the advertised radius
-    pub radius_top: u8,
-    /// Percentage coverage, not including the top byte
-    pub radius_lower_fraction: f64,
-    pub node_id: u64,
-    pub node_id_string: String,
-    pub raw_enr: String,
-}
-
-#[derive(FromQueryResult, Serialize)]
-pub struct ClientDiversityResult {
-    pub client_name: String,
-    pub client_count: i32,
-}
-
-#[derive(FromQueryResult, Serialize)]
-pub struct RawEnr {
-    pub raw: String,
-}
-
-impl Display for ClientDiversityResult {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Client Name {} Client Count {}",
-            self.client_name, self.client_count
-        )
-    }
-}
-
-async fn generate_radius_graph_data(
-    state: &Arc<State>,
-    subprotocol: SubProtocol,
-) -> Vec<CalculatedRadiusChartData> {
-    let radius_chart_data = RadiusChartData::find_by_statement(Statement::from_sql_and_values( DbBackend::Postgres,
-    "
-        WITH latest_census AS (
-            SELECT started_at, duration
-            FROM census
-            WHERE sub_network = $1
-            ORDER BY started_at DESC
-            LIMIT 1
-        )
-        SELECT 
-            census_node.data_radius,
-            record.raw,
-            node.node_id
-        FROM 
-            census_node,
-            node,
-            record,
-            latest_census
-        WHERE
-            census_node.sub_network = $1
-            AND census_node.surveyed_at >= latest_census.started_at
-            AND census_node.surveyed_at < latest_census.started_at + latest_census.duration * interval '1 second'
-            AND census_node.record_id = record.id
-            AND record.node_id = node.id
-            ",
-     vec![subprotocol.into()])).all(&state.database_connection).await.unwrap();
-
-    let mut radius_percentages: Vec<CalculatedRadiusChartData> = vec![];
-    for i in radius_chart_data {
-        let radius_fraction = xor_distance_to_fraction([
-            i.data_radius[0],
-            i.data_radius[1],
-            i.data_radius[2],
-            i.data_radius[3],
-        ]);
-        let node_id_high_bytes: [u8; 8] = [
-            i.node_id[0],
-            i.node_id[1],
-            i.node_id[2],
-            i.node_id[3],
-            i.node_id[4],
-            i.node_id[5],
-            i.node_id[6],
-            i.node_id[7],
-        ];
-
-        let formatted_percentage = format!("{:.2}", radius_fraction * 100.0);
-
-        let mut node_id_bytes: [u8; 32] = [0; 32];
-        if i.node_id.len() == 32 {
-            node_id_bytes.copy_from_slice(&i.node_id);
-        }
-
-        let radius_lower_fraction = xor_distance_to_fraction([
-            i.data_radius[1],
-            i.data_radius[2],
-            i.data_radius[3],
-            i.data_radius[4],
-        ]);
-
-        let node_id_string = hex_encode(node_id_bytes);
-        radius_percentages.push(CalculatedRadiusChartData {
-            data_radius: formatted_percentage.parse().unwrap(),
-            radius_top: i.data_radius[0],
-            radius_lower_fraction,
-            node_id: u64::from_be_bytes(node_id_high_bytes),
-            node_id_string,
-            raw_enr: i.raw,
-        });
-    }
-
-    radius_percentages
-}
-
-fn xor_distance_to_fraction(radius_high_bytes: [u8; 4]) -> f64 {
-    let radius_int = u32::from_be_bytes(radius_high_bytes);
-    radius_int as f64 / u32::MAX as f64
-}
-
-async fn get_max_census_id(state: &Arc<State>, subprotocol: SubProtocol) -> Option<MaxCensusId> {
-    match MaxCensusId::find_by_statement(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        "SELECT MAX(id) as id FROM census
-             WHERE sub_network = $1",
-        vec![subprotocol.into()],
-    ))
-    .one(&state.database_connection)
-    .await
-    {
-        Ok(val) => val,
-        Err(err) => {
-            warn!("Census data unavailable: {err}");
-            None
-        }
-    }
-}
-
-async fn get_created_data_from_census_id(state: &Arc<State>, census_id: i32) -> DateTime<Utc> {
-    let builder = state.database_connection.get_database_backend();
-    // we need to bounds check the requested census_id and return None if it doesn't exist
-    let created_data = Query::select()
-        .from(census::Entity)
-        .expr_as(
-            Expr::col(census::Column::StartedAt),
-            Alias::new("created_at"),
-        )
-        .and_where(Expr::col(census::Column::Id).eq(census_id))
-        .take();
-    let created_data = CensusCreatedAt::find_by_statement(builder.build(&created_data))
-        .one(&state.database_connection)
-        .await
-        .unwrap();
-    created_data.unwrap().created_at
-}
-
-async fn generate_client_diversity_data(
-    state: &Arc<State>,
-    census_id: i32,
-) -> Option<Vec<ClientDiversityResult>> {
-    Some(
-        ClientDiversityResult::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres,
-        "
-            WITH left_table AS (
-                SELECT census_node.record_id
-                FROM census_node
-                WHERE census_node.census_id = $1
-            ),
-            right_table AS (
-                SELECT record_id, value
-                FROM key_value
-                WHERE convert_from(key, 'UTF8') = 'c'
-            )
-            SELECT 
-                CAST(COUNT(*) AS INTEGER) AS client_count,
-                CAST(COALESCE(substr(substr(right_table.value, 1, 2), length(substr(right_table.value, 1, 2)), 1), 'unknown') AS TEXT) AS client_name
-            FROM left_table
-            LEFT JOIN right_table ON left_table.record_id = right_table.record_id
-            GROUP BY substr(substr(right_table.value, 1, 2), length(substr(right_table.value, 1, 2)), 1)
-            ", vec![census_id.into()])
-        ).all(&state.database_connection).await.unwrap(),
-    )
-}
 // Get the subprotocol from the query parameters, defaulting to History
 pub fn get_subprotocol_from_params(params: &HashMap<String, String>) -> SubProtocol {
     match params.get("network") {
@@ -268,58 +65,6 @@ pub fn get_subprotocol_from_params(params: &HashMap<String, String>) -> SubProto
             None => SubProtocol::History,
         },
     }
-}
-
-async fn generate_enr_list_from_census_id(
-    state: &Arc<State>,
-    census_id: Option<i32>,
-    max_census_id: MaxCensusId,
-) -> Option<Vec<RawEnr>> {
-    let census_selection_query = match census_id {
-        Some(census_id) => {
-            if census_id >= 1 && census_id <= max_census_id.id {
-                Query::select()
-                    .from(census::Entity)
-                    .expr_as(Expr::col(census::Column::Id), Alias::new("id"))
-                    .and_where(SimpleExpr::from(Expr::col(census::Column::Id)).eq(census_id))
-                    .limit(1)
-                    .take()
-            } else {
-                return None;
-            }
-        }
-        None => Query::select()
-            .from(census::Entity)
-            .expr_as(Expr::col(census::Column::Id), Alias::new("id"))
-            .order_by(census::Column::StartedAt, Order::Desc)
-            .limit(1)
-            .take(),
-    };
-
-    let builder = state.database_connection.get_database_backend();
-    let mut enrs_from_census = Query::select();
-    enrs_from_census
-        .expr(Expr::col((record::Entity, record::Column::Raw)))
-        .from(census_node::Entity)
-        .from(record::Entity)
-        .from_subquery(census_selection_query, Alias::new("selected_census_id"))
-        .and_where(
-            Expr::col((census_node::Entity, census_node::Column::CensusId)).eq(Expr::col((
-                Alias::new("selected_census_id"),
-                Alias::new("id"),
-            ))),
-        )
-        .and_where(
-            Expr::col((census_node::Entity, census_node::Column::RecordId))
-                .eq(Expr::col((record::Entity, record::Column::Id))),
-        );
-
-    Some(
-        RawEnr::find_by_statement(builder.build(&enrs_from_census))
-            .all(&state.database_connection)
-            .await
-            .unwrap(),
-    )
 }
 
 pub async fn network_overview(
@@ -1338,3 +1083,258 @@ pub async fn single_census_view(
     Ok(HtmlTemplate(template))
 }
 
+async fn generate_enr_list_from_census_id(
+    state: &Arc<State>,
+    census_id: Option<i32>,
+    max_census_id: MaxCensusId,
+) -> Option<Vec<RawEnr>> {
+    let census_selection_query = match census_id {
+        Some(census_id) => {
+            if census_id >= 1 && census_id <= max_census_id.id {
+                Query::select()
+                    .from(census::Entity)
+                    .expr_as(Expr::col(census::Column::Id), Alias::new("id"))
+                    .and_where(SimpleExpr::from(Expr::col(census::Column::Id)).eq(census_id))
+                    .limit(1)
+                    .take()
+            } else {
+                return None;
+            }
+        }
+        None => Query::select()
+            .from(census::Entity)
+            .expr_as(Expr::col(census::Column::Id), Alias::new("id"))
+            .order_by(census::Column::StartedAt, Order::Desc)
+            .limit(1)
+            .take(),
+    };
+
+    let builder = state.database_connection.get_database_backend();
+    let mut enrs_from_census = Query::select();
+    enrs_from_census
+        .expr(Expr::col((record::Entity, record::Column::Raw)))
+        .from(census_node::Entity)
+        .from(record::Entity)
+        .from_subquery(census_selection_query, Alias::new("selected_census_id"))
+        .and_where(
+            Expr::col((census_node::Entity, census_node::Column::CensusId)).eq(Expr::col((
+                Alias::new("selected_census_id"),
+                Alias::new("id"),
+            ))),
+        )
+        .and_where(
+            Expr::col((census_node::Entity, census_node::Column::RecordId))
+                .eq(Expr::col((record::Entity, record::Column::Id))),
+        );
+
+    Some(
+        RawEnr::find_by_statement(builder.build(&enrs_from_census))
+            .all(&state.database_connection)
+            .await
+            .unwrap(),
+    )
+}
+
+async fn get_created_data_from_census_id(state: &Arc<State>, census_id: i32) -> DateTime<Utc> {
+    let builder = state.database_connection.get_database_backend();
+    // we need to bounds check the requested census_id and return None if it doesn't exist
+    let created_data = Query::select()
+        .from(census::Entity)
+        .expr_as(
+            Expr::col(census::Column::StartedAt),
+            Alias::new("created_at"),
+        )
+        .and_where(Expr::col(census::Column::Id).eq(census_id))
+        .take();
+    let created_data = CensusCreatedAt::find_by_statement(builder.build(&created_data))
+        .one(&state.database_connection)
+        .await
+        .unwrap();
+    created_data.unwrap().created_at
+}
+
+#[derive(FromQueryResult, Debug, Clone, Copy)]
+pub struct MaxCensusId {
+    pub id: i32,
+}
+
+#[derive(FromQueryResult, Serialize, Debug, Clone)]
+pub struct PaginatedCensusListResult {
+    pub census_id: i32,
+    pub node_count: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(FromQueryResult, Debug, Clone)]
+pub struct CensusCreatedAt {
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(FromQueryResult, Debug)]
+pub struct RadiusChartData {
+    pub data_radius: Vec<u8>,
+    pub node_id: Vec<u8>,
+    pub raw: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct CalculatedRadiusChartData {
+    pub data_radius: f64,
+    /// Top byte of the advertised radius
+    pub radius_top: u8,
+    /// Percentage coverage, not including the top byte
+    pub radius_lower_fraction: f64,
+    pub node_id: u64,
+    pub node_id_string: String,
+    pub raw_enr: String,
+}
+
+#[derive(FromQueryResult, Serialize)]
+pub struct ClientDiversityResult {
+    pub client_name: String,
+    pub client_count: i32,
+}
+
+#[derive(FromQueryResult, Serialize)]
+pub struct RawEnr {
+    pub raw: String,
+}
+
+impl Display for ClientDiversityResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Client Name {} Client Count {}",
+            self.client_name, self.client_count
+        )
+    }
+}
+
+async fn generate_radius_graph_data(
+    state: &Arc<State>,
+    subprotocol: SubProtocol,
+) -> Vec<CalculatedRadiusChartData> {
+    let radius_chart_data = RadiusChartData::find_by_statement(Statement::from_sql_and_values( DbBackend::Postgres,
+    "
+        WITH latest_census AS (
+            SELECT started_at, duration
+            FROM census
+            WHERE sub_network = $1
+            ORDER BY started_at DESC
+            LIMIT 1
+        )
+        SELECT 
+            census_node.data_radius,
+            record.raw,
+            node.node_id
+        FROM 
+            census_node,
+            node,
+            record,
+            latest_census
+        WHERE
+            census_node.sub_network = $1
+            AND census_node.surveyed_at >= latest_census.started_at
+            AND census_node.surveyed_at < latest_census.started_at + latest_census.duration * interval '1 second'
+            AND census_node.record_id = record.id
+            AND record.node_id = node.id
+            ",
+     vec![subprotocol.into()])).all(&state.database_connection).await.unwrap();
+
+    let mut radius_percentages: Vec<CalculatedRadiusChartData> = vec![];
+    for i in radius_chart_data {
+        let radius_fraction = xor_distance_to_fraction([
+            i.data_radius[0],
+            i.data_radius[1],
+            i.data_radius[2],
+            i.data_radius[3],
+        ]);
+        let node_id_high_bytes: [u8; 8] = [
+            i.node_id[0],
+            i.node_id[1],
+            i.node_id[2],
+            i.node_id[3],
+            i.node_id[4],
+            i.node_id[5],
+            i.node_id[6],
+            i.node_id[7],
+        ];
+
+        let formatted_percentage = format!("{:.2}", radius_fraction * 100.0);
+
+        let mut node_id_bytes: [u8; 32] = [0; 32];
+        if i.node_id.len() == 32 {
+            node_id_bytes.copy_from_slice(&i.node_id);
+        }
+
+        let radius_lower_fraction = xor_distance_to_fraction([
+            i.data_radius[1],
+            i.data_radius[2],
+            i.data_radius[3],
+            i.data_radius[4],
+        ]);
+
+        let node_id_string = hex_encode(node_id_bytes);
+        radius_percentages.push(CalculatedRadiusChartData {
+            data_radius: formatted_percentage.parse().unwrap(),
+            radius_top: i.data_radius[0],
+            radius_lower_fraction,
+            node_id: u64::from_be_bytes(node_id_high_bytes),
+            node_id_string,
+            raw_enr: i.raw,
+        });
+    }
+
+    radius_percentages
+}
+
+fn xor_distance_to_fraction(radius_high_bytes: [u8; 4]) -> f64 {
+    let radius_int = u32::from_be_bytes(radius_high_bytes);
+    radius_int as f64 / u32::MAX as f64
+}
+
+async fn get_max_census_id(state: &Arc<State>, subprotocol: SubProtocol) -> Option<MaxCensusId> {
+    match MaxCensusId::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT MAX(id) as id FROM census
+             WHERE sub_network = $1",
+        vec![subprotocol.into()],
+    ))
+    .one(&state.database_connection)
+    .await
+    {
+        Ok(val) => val,
+        Err(err) => {
+            warn!("Census data unavailable: {err}");
+            None
+        }
+    }
+}
+
+async fn generate_client_diversity_data(
+    state: &Arc<State>,
+    census_id: i32,
+) -> Option<Vec<ClientDiversityResult>> {
+    Some(
+        ClientDiversityResult::find_by_statement(Statement::from_sql_and_values(DbBackend::Postgres,
+        "
+            WITH left_table AS (
+                SELECT census_node.record_id
+                FROM census_node
+                WHERE census_node.census_id = $1
+            ),
+            right_table AS (
+                SELECT record_id, value
+                FROM key_value
+                WHERE convert_from(key, 'UTF8') = 'c'
+            )
+            SELECT 
+                CAST(COUNT(*) AS INTEGER) AS client_count,
+                CAST(COALESCE(substr(substr(right_table.value, 1, 2), length(substr(right_table.value, 1, 2)), 1), 'unknown') AS TEXT) AS client_name
+            FROM left_table
+            LEFT JOIN right_table ON left_table.record_id = right_table.record_id
+            GROUP BY substr(substr(right_table.value, 1, 2), length(substr(right_table.value, 1, 2)), 1)
+            ", vec![census_id.into()])
+        ).all(&state.database_connection).await.unwrap(),
+    )
+}
